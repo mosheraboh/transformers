@@ -567,7 +567,7 @@ class T5Attention(nn.Module):
                 key=key_states.permute(0,2,1,3), # -> BHMK -> BMHK
                 value=value_states.permute(0,2,1,3), # -> BHMK -> BMHK
                 p=self.dropout,
-                attn_bias=position_bias_masked.contiguous(),
+                attn_bias=position_bias_masked.contiguous().to(query_states.dtype), #do we really need it to be contiguous on A100+mixed precision+FLASHv2??
                 scale = 1.0,
             ).reshape(B, M, H*K)            
             #flash_attn_output_pre_projection = flash_attn_output_pre_projection.permute(0,2,3,1).reshape(B, M, H*K)     

@@ -472,8 +472,8 @@ class T5Attention(nn.Module):
         # past_key_value[0] is (batch_size, n_heads, q_len - 1, dim_per_head)
         batch_size, seq_length = hidden_states.shape[:2]
 
-        # print('DEBUG DEBUG DEBUG! cancelled dropout for debugging! remove this!!!\n'*10)
-        # self.dropout = 0.0
+        print('DEBUG DEBUG DEBUG! cancelled dropout for debugging! remove this!!!\n'*10)
+        self.dropout = 0.0
         
 
 
@@ -553,27 +553,30 @@ class T5Attention(nn.Module):
                 position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
         
         if self.pruned_heads:
-            mask = torch.ones(position_bias.shape[1])
-            mask[list(self.pruned_heads)] = 0
-            position_bias_masked = position_bias[:, mask.bool()]
+            mask_for_pruned = torch.ones(position_bias.shape[1])
+            mask_for_pruned[list(self.pruned_heads)] = 0
+            position_bias_masked = position_bias[:, mask_for_pruned.bool()]
         else:
             position_bias_masked = position_bias
         
+        
+        def _compress_to_single_unpadded_sample(tens:torch.Tensor, sizes:List[int]):
+            separated = [tens[i,:,:curr_len] for (i,curr_len) in enumerate(sizes)]
+            ans = torch.concat(separated, dim=1)[None,...]
+            return ans
+
+        def _convert_to_single_padded_tensor(tens:torch.Tensor, sizes:List[int], pad_to_size:int, pad_value:float=0.0):
+            multi = tens.split(sizes, dim=1)
+            multi = [ torch.nn.functional.pad(x, ((0,0,0,0,0,pad_to_size-curr_size))) for (x,curr_size) in zip(multi, sizes) ]
+            ans = torch.concat(multi, dim=0)
+            return ans
+
         B,H,M,K = query_states.shape
         USE_FLASH_ATTENTION = True
-        if USE_FLASH_ATTENTION:
-            attn_output = xops.memory_efficient_attention(
-                query=query_states.permute(0,2,1,3), # -> BHMK -> BMHK
-                key=key_states.permute(0,2,1,3), # -> BHMK -> BMHK
-                value=value_states.permute(0,2,1,3), # -> BHMK -> BMHK
-                p=self.dropout,
-                attn_bias=position_bias_masked.contiguous().to(query_states.dtype), #do we really need it to be contiguous on A100+mixed precision+FLASHv2??
-                scale = 1.0,
-            ).reshape(B, M, H*K)            
-            #flash_attn_output_pre_projection = flash_attn_output_pre_projection.permute(0,2,3,1).reshape(B, M, H*K)     
+        #if not USE_FLASH_ATTENTION:
 
-            #).permute(0,2,1,3).reshape(query_states.shape[0], query_states.shape[2], query_states.shape[1]*query_states.shape[3])
-        else:
+        if True:
+        #else:
             # compute scores
             scores = torch.matmul(
                 query_states, key_states.transpose(3, 2)
@@ -592,6 +595,38 @@ class T5Attention(nn.Module):
                 attn_weights = attn_weights * layer_head_mask
 
             attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
+            
+        if True:
+            print("attn_output_from_flash is currently not used AND remember about contiguous()")
+
+            if (mask.shape[1]==1) and (mask.shape[2]==1): #non-causal case
+                original_max_seq_len = mask.shape[-1]
+                actual_lengths = mask[:,0,0,:].argmin(1).tolist() #creates a cpu-gpu sync... we can probably get this information in the forward instead of reverse engineering it ...
+                attn_bias = xattn.BlockDiagonalMask.from_seqlens(q_seqlen=actual_lengths)
+                query_states = _compress_to_single_unpadded_sample(query_states, actual_lengths)
+                key_states = _compress_to_single_unpadded_sample(key_states, actual_lengths)
+                value_states = _compress_to_single_unpadded_sample(value_states, actual_lengths)
+            else:
+                raise Exception("not supporting causal yet")
+
+
+            attn_output_from_flash = xops.memory_efficient_attention(
+                query=query_states.permute(0,2,1,3), # -> BHMK -> BMHK
+                key=key_states.permute(0,2,1,3), # -> BHMK -> BMHK
+                value=value_states.permute(0,2,1,3), # -> BHMK -> BMHK
+                p=self.dropout,
+                #attn_bias=position_bias_masked.contiguous().to(query_states.dtype), #do we really need it to be contiguous on A100+mixed precision+FLASHv2??
+                attn_bias=attn_bias,
+                scale = 1.0,
+            )
+
+            attn_output_from_flash = _convert_to_single_padded_tensor(attn_output_from_flash, sizes=actual_lengths, pad_to_size=original_max_seq_len)
+            
+            attn_output_from_flash = attn_output_from_flash.reshape(B, M, H*K)            
+            #flash_attn_output_pre_projection = flash_attn_output_pre_projection.permute(0,2,3,1).reshape(B, M, H*K)     
+
+            #).permute(0,2,1,3).reshape(query_states.shape[0], query_states.shape[2], query_states.shape[1]*query_states.shape[3])
+        
         attn_output = self.o(attn_output)
 
         present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None

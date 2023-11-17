@@ -572,7 +572,7 @@ class T5Attention(nn.Module):
             return ans
 
         B,H,M,K = query_states.shape
-        USE_FLASH_ATTENTION = True #True        
+        USE_FLASH_ATTENTION = False #True        
 
         if not USE_FLASH_ATTENTION:
         #else:

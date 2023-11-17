@@ -472,8 +472,8 @@ class T5Attention(nn.Module):
         # past_key_value[0] is (batch_size, n_heads, q_len - 1, dim_per_head)
         batch_size, seq_length = hidden_states.shape[:2]
 
-        print('DEBUG DEBUG DEBUG! cancelled dropout for debugging! remove this!!!\n'*10)
-        self.dropout = 0.0
+        #print('DEBUG DEBUG DEBUG! cancelled dropout for debugging! remove this!!!\n'*10)
+        #self.dropout = 0.0
         
 
 
@@ -572,10 +572,9 @@ class T5Attention(nn.Module):
             return ans
 
         B,H,M,K = query_states.shape
-        USE_FLASH_ATTENTION = True
-        #if not USE_FLASH_ATTENTION:
+        USE_FLASH_ATTENTION = True #True        
 
-        if True:
+        if not USE_FLASH_ATTENTION:
         #else:
             # compute scores
             scores = torch.matmul(
@@ -595,12 +594,13 @@ class T5Attention(nn.Module):
                 attn_weights = attn_weights * layer_head_mask
 
             attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
-            
-        if True:
-            print("attn_output_from_flash is currently not used AND remember about contiguous()")
+
+        else:
+        #if True:
+            #print("attn_output_from_flash is currently not used AND remember about contiguous()")
 
             if (mask.shape[1]==1) and (mask.shape[2]==1): #non-causal case
-                original_max_seq_len = mask.shape[-1]
+                original_max_seq_len = mask.shape[-1] ##it is also found in real_seq_length, possibly switch to it
                 actual_lengths = mask[:,0,0,:].argmin(1).tolist() #creates a cpu-gpu sync... we can probably get this information in the forward instead of reverse engineering it ...
                 attn_bias = xattn.BlockDiagonalMask.from_seqlens(q_seqlen=actual_lengths)
                 query_states = _compress_to_single_unpadded_sample(query_states, actual_lengths)
@@ -610,7 +610,7 @@ class T5Attention(nn.Module):
                 raise Exception("not supporting causal yet")
 
 
-            attn_output_from_flash = xops.memory_efficient_attention(
+            attn_output = xops.memory_efficient_attention(
                 query=query_states.permute(0,2,1,3), # -> BHMK -> BMHK
                 key=key_states.permute(0,2,1,3), # -> BHMK -> BMHK
                 value=value_states.permute(0,2,1,3), # -> BHMK -> BMHK
@@ -620,9 +620,8 @@ class T5Attention(nn.Module):
                 scale = 1.0,
             )
 
-            attn_output_from_flash = _convert_to_single_padded_tensor(attn_output_from_flash, sizes=actual_lengths, pad_to_size=original_max_seq_len)
-            
-            attn_output_from_flash = attn_output_from_flash.reshape(B, M, H*K)            
+            attn_output = _convert_to_single_padded_tensor(attn_output, sizes=actual_lengths, pad_to_size=original_max_seq_len)            
+            attn_output = attn_output.reshape(B, M, H*K)            
             #flash_attn_output_pre_projection = flash_attn_output_pre_projection.permute(0,2,3,1).reshape(B, M, H*K)     
 
             #).permute(0,2,1,3).reshape(query_states.shape[0], query_states.shape[2], query_states.shape[1]*query_states.shape[3])

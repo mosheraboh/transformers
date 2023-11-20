@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ PyTorch T5 model."""
-
+assert False, 'development moved to branch "flash"'
 
 import copy
 import math

@@ -973,13 +973,15 @@ class T5Stack(T5PreTrainedModel):
         self.embed_tokens = embed_tokens
         self.is_decoder = config.is_decoder
         self.position_embedding_definitions = config.position_embedding_definitions if hasattr(config, "position_embedding_definitions") else {}
+        # add definition for POSITION_EMBEDDING_SINUSOIDAL
+        self.position_embedding_definitions[POSITION_EMBEDDING_SINUSOIDAL] = {"is_relative": False}
 
         self.abs_position_embedding_dict = nn.ModuleDict()
         relative_position_embedding_definitions = {}
        
         for position_embedding_name, embedding_config in self.position_embedding_definitions.items():
-            if embedding_config.is_relative:
-                relative_position_embedding_definitions[position_embedding_name] = {k:v for k,v in embedding_config.items() if k!= "is_relative"}
+            if embedding_config["is_relative"]:
+                relative_position_embedding_definitions[position_embedding_name] = {k:v for k,v in embedding_config.items() if k!= "is_relative"} # copy embedding config except "is_relative"
             else:
                 if position_embedding_name == POSITION_EMBEDDING_SINUSOIDAL:
                     self.abs_position_embedding_dict[POSITION_EMBEDDING_SINUSOIDAL] = SinusoidalPositionalEmbedding(config.d_model)
@@ -1100,6 +1102,10 @@ class T5Stack(T5PreTrainedModel):
 
         if position_ids_dict is None:
             position_ids_dict = {}
+
+        for _, position_embedding_types in position_ids_dict.values():
+            if position_embedding_types[0] not in self.position_embedding_definitions:
+                raise RuntimeError(f"{position_embedding_types[0]} is not defined! Please define it in bmfm_t5_model_kwargs.extra_t5_config_kwargs.position_embedding_definitions")
 
         position_ids_info_list_for_relative_embeddings = []
         if add_t5_relative_position_embedding:
@@ -1678,11 +1684,6 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
 
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
 
-        # collect info on declared position types, for input validity test during forward
-        position_embedding_definitions = config.position_embedding_definitions if hasattr(config, "position_embedding_definitions") else {}
-        self.position_embedding_is_relative_dict = {k: v.is_relative for k,v in position_embedding_definitions.items()}  
-        self.position_embedding_is_relative_dict[POSITION_EMBEDDING_SINUSOIDAL] = False
-
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
@@ -1824,12 +1825,6 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         
         if add_t5_relative_position_embedding is None:
             add_t5_relative_position_embedding = True
-
-        for _, position_embedding_types in encoder_position_ids_dict.values():  # each entry in values is a tupple of (tensor of position ods, list of position_embedding_names ) # consider using collate to transform the list to a single item
-            assert position_embedding_types[0] in self.position_embedding_is_relative_dict
-        
-        for _, position_embedding_types in decoder_position_ids_dict.values():
-            assert position_embedding_types[0] in self.position_embedding_is_relative_dict
 
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict

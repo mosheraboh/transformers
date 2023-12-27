@@ -584,6 +584,34 @@ class T5Attention(nn.Module):
         relative_buckets += torch.where(is_small, relative_position, relative_position_if_large)
         return relative_buckets
 
+    
+    def inject_position_embedding(self, position_ids_info_list, real_seq_length, key_length, key_states, query_states):
+        position_bias = None
+        xattn_AttentionBias_forbidden = False
+        B,H,M,K = query_states.shape
+        for position_ids, position_embedding_name in position_ids_info_list:
+            pos_emb_type = self.positional_embedding_injected_in_attention[position_embedding_name]['type']
+            if pos_emb_type in [POSITION_EMBEDDING_T5_DEFAULT_RELATIVE, POSITION_EMBEDDING_T5_RELATIVE]:
+                curr_position_bias = self.compute_bias_for_relative_position_embedding_name(position_embedding_name=position_embedding_name, position_ids=position_ids, query_length=real_seq_length, key_length=key_length, device=query_states.device)
+                position_bias = curr_position_bias if position_bias is None else (position_bias+curr_position_bias)
+                xattn_AttentionBias_forbidden = True
+            elif pos_emb_type == POSITION_EMBEDDING_ROTARY:
+                position_bias  = torch.zeros(
+                    (1, self.n_heads, real_seq_length, key_length), device=query_states.device, dtype=query_states.dtype
+                )
+                if self.gradient_checkpointing and self.training:
+                    position_bias.requires_grad = True
+                query_states, key_states = self.rotary_op(
+                    query_states.permute(0,2,1,3).reshape(B,M,H*K), 
+                    key_states.permute(0,2,1,3).reshape(B,M,H*K),
+                    custom_indices=position_ids
+                    )
+                query_states = query_states.reshape(B,M,H,K).permute(0,2,1,3)
+                key_states = key_states.reshape(B,M,H,K).permute(0,2,1,3)
+            else:
+                raise Exception(f'Encountered pos_emb_type={pos_emb_type} but the only supported options to be injected inside attention are {SUPPORTED_POS_ENC_TYPES_INJECTED_IN_ATTENTION}')
+        return position_bias, query_states, key_states, xattn_AttentionBias_forbidden
+    
     def compute_bias_for_relative_position_embedding_name(self, position_embedding_name, position_ids, query_length, key_length, device=None):
         """Compute binned relative position bias"""
         if position_embedding_name == POSITION_EMBEDDING_T5_DEFAULT_RELATIVE:
@@ -598,9 +626,9 @@ class T5Attention(nn.Module):
         else:
             raise Exception(f'compute_bias_for_relative_position_embedding_name() only supports {POSITION_EMBEDDING_T5_DEFAULT_RELATIVE} and {POSITION_EMBEDDING_T5_RELATIVE}')
 
-        return self.compute_bias(relative_attention_bias=relative_attention_bias, position_ids=position_ids, num_buckets=num_buckets, max_distance=max_distance, query_length=query_length, key_length=key_length, device=device)
+        return self.compute_bias_for_relative_position(relative_attention_bias=relative_attention_bias, position_ids=position_ids, num_buckets=num_buckets, max_distance=max_distance, query_length=query_length, key_length=key_length, device=device)
 
-    def compute_bias(self, relative_attention_bias, position_ids, num_buckets, max_distance, query_length, key_length, device=None):
+    def compute_bias_for_relative_position(self, relative_attention_bias, position_ids, num_buckets, max_distance, query_length, key_length, device=None):
         """Compute binned relative position bias"""
         if device is None:
             device = relative_attention_bias.weight.device
@@ -727,8 +755,6 @@ class T5Attention(nn.Module):
             ans = torch.concat(multi, dim=0)
             return ans
 
-        B,H,M,K = query_states.shape
-
         add_to_scores = None
 
         if position_bias is None:
@@ -739,37 +765,24 @@ class T5Attention(nn.Module):
             #xattn_AttentionBias_forbidden = False
         else:
             position_bias, xattn_AttentionBias_forbidden = position_bias
-
         
         
-        
-        if position_bias is None: 
-            if position_ids_info_list:                
-                for position_ids, position_embedding_name in position_ids_info_list:
-                    pos_emb_type = self.positional_embedding_injected_in_attention[position_embedding_name]['type']
-                    if pos_emb_type in [POSITION_EMBEDDING_T5_DEFAULT_RELATIVE, POSITION_EMBEDDING_T5_RELATIVE]:
-                        curr_position_bias = self.compute_bias_for_relative_position_embedding_name(position_embedding_name=position_embedding_name, position_ids=position_ids, query_length=real_seq_length, key_length=key_length, device=query_states.device)
-                        position_bias = curr_position_bias if position_bias is None else (position_bias+curr_position_bias)  # michal: shape don't match
-                        xattn_AttentionBias_forbidden = True
-                    elif pos_emb_type == POSITION_EMBEDDING_ROTARY:
-                        query_states, key_states = self.rotary_op(
-                            query_states.permute(0,2,1,3).reshape(B,M,H*K), 
-                            key_states.permute(0,2,1,3).reshape(B,M,H*K),
-                            custom_indices=position_ids
-                            )
-                        query_states = query_states.reshape(B,M,H,K).permute(0,2,1,3)
-                        key_states = key_states.reshape(B,M,H,K).permute(0,2,1,3)
-                    else:
-                        raise Exception(f'Encountered pos_emb_type={pos_emb_type} but the only supported options to be injected inside attention are {SUPPORTED_POS_ENC_TYPES_INJECTED_IN_ATTENTION}')
-                        
-
-            if position_bias is None: # if it's STILL None (so no one requested POSITION_EMBEDDING_T5_RELATIVE)
+        if position_bias is None:
+            if self.positional_embedding_injected_in_attention is None:
                 position_bias = torch.zeros(
                     (1, self.n_heads, real_seq_length, key_length), device=query_states.device, dtype=query_states.dtype
                 )
                 if self.gradient_checkpointing and self.training:
                     position_bias.requires_grad = True
-
+            else:
+                position_bias, query_states, key_states, xattn_AttentionBias_forbidden_pos_emb = \
+                    self.inject_position_embedding(position_ids_info_list=position_ids_info_list,
+                                             real_seq_length=real_seq_length,
+                                             key_length=key_length,
+                                             key_states=key_states,
+                                             query_states=query_states)
+                xattn_AttentionBias_forbidden |= xattn_AttentionBias_forbidden_pos_emb
+             
                         
             # if key and values are already calculated
             # we want only the last query position bias
@@ -927,7 +940,7 @@ class T5LayerSelfAttention(nn.Module):
 class T5LayerCrossAttention(nn.Module):
     def __init__(self, config, positional_embedding_injected_in_attention=None):
         super().__init__()
-        self.EncDecAttention = T5Attention(config, positional_embedding_injected_in_attention=positional_embedding_injected_in_attention)
+        self.EncDecAttention = T5Attention(config, positional_embedding_injected_in_attention=None)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -1047,7 +1060,6 @@ class T5Block(nn.Module):
                 query_length=query_length,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
-                position_ids_info_list=position_ids_info_list,
             )
             hidden_states = cross_attention_outputs[0]
 

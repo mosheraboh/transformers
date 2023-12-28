@@ -170,7 +170,7 @@ class RotaryEmbedding(torch.nn.Module):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, custom_indices:torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
+        # print("using RotaryEmbedding")
         self._cos_cached, self._sin_cached = self._update_cos_sin_tables(
             k, seq_dimension=-2,
             custom_indices=custom_indices,
@@ -477,6 +477,8 @@ class T5Attention(nn.Module):
     def __init__(self, config: T5Config, positional_embedding_injected_in_attention=None):
         super().__init__()
         self.is_decoder = config.is_decoder
+        # print("attention block")
+        # print(positional_embedding_injected_in_attention)
         self.positional_embedding_injected_in_attention = positional_embedding_injected_in_attention
         
         self.relative_attention_num_buckets = config.relative_attention_num_buckets
@@ -592,7 +594,7 @@ class T5Attention(nn.Module):
         for position_ids, position_embedding_name in position_ids_info_list:
             pos_emb_type = self.positional_embedding_injected_in_attention[position_embedding_name]['type']
             if pos_emb_type in [POSITION_EMBEDDING_T5_DEFAULT_RELATIVE, POSITION_EMBEDDING_T5_RELATIVE]:
-                curr_position_bias = self.compute_bias_for_relative_position_embedding_name(position_embedding_name=position_embedding_name, position_ids=position_ids, query_length=real_seq_length, key_length=key_length, device=query_states.device)
+                curr_position_bias = self.compute_bias_for_relative_position_embedding_name(position_embedding_name=position_embedding_name, position_embedding_type=pos_emb_type, position_ids=position_ids, query_length=real_seq_length, key_length=key_length, device=query_states.device)
                 position_bias = curr_position_bias if position_bias is None else (position_bias+curr_position_bias)
                 xattn_AttentionBias_forbidden = True
             elif pos_emb_type == POSITION_EMBEDDING_ROTARY:
@@ -612,19 +614,19 @@ class T5Attention(nn.Module):
                 raise Exception(f'Encountered pos_emb_type={pos_emb_type} but the only supported options to be injected inside attention are {SUPPORTED_POS_ENC_TYPES_INJECTED_IN_ATTENTION}')
         return position_bias, query_states, key_states, xattn_AttentionBias_forbidden
     
-    def compute_bias_for_relative_position_embedding_name(self, position_embedding_name, position_ids, query_length, key_length, device=None):
+    def compute_bias_for_relative_position_embedding_name(self, position_embedding_name, position_embedding_type, position_ids, query_length, key_length, device=None):
         """Compute binned relative position bias"""
-        if position_embedding_name == POSITION_EMBEDDING_T5_DEFAULT_RELATIVE:
+        if position_embedding_type == POSITION_EMBEDDING_T5_DEFAULT_RELATIVE:
             ### take the default t5 relative positional attention (will also use existing weights, possibly pretrained)
             relative_attention_bias = self.relative_attention_bias ###the single one we reuse for anyone who wishes to use it
             num_buckets=self.relative_attention_num_buckets
             max_distance=self.relative_attention_max_distance      
-        elif position_embedding_name == POSITION_EMBEDDING_T5_RELATIVE:        
+        elif position_embedding_type == POSITION_EMBEDDING_T5_RELATIVE:        
             relative_attention_bias = self.relative_attention_bias_dict[position_embedding_name] #possibly multiple, depending on the definition in position_embedding_definitions
             num_buckets =self.relative_position_embedding_definitions[position_embedding_name].get("num_buckets", self.relative_attention_num_buckets)
             max_distance=self.relative_position_embedding_definitions[position_embedding_name].get("max_distance", self.relative_attention_max_distance)
         else:
-            raise Exception(f'compute_bias_for_relative_position_embedding_name() only supports {POSITION_EMBEDDING_T5_DEFAULT_RELATIVE} and {POSITION_EMBEDDING_T5_RELATIVE}')
+            raise Exception(f'compute_bias_for_relative_position_embedding_name() only supports {POSITION_EMBEDDING_T5_DEFAULT_RELATIVE} and {POSITION_EMBEDDING_T5_RELATIVE} got {position_embedding_type}')
 
         return self.compute_bias_for_relative_position(relative_attention_bias=relative_attention_bias, position_ids=position_ids, num_buckets=num_buckets, max_distance=max_distance, query_length=query_length, key_length=key_length, device=device)
 
@@ -767,6 +769,7 @@ class T5Attention(nn.Module):
             position_bias, xattn_AttentionBias_forbidden = position_bias
         
         
+        B,H,M,K = query_states.shape
         if position_bias is None:
             if self.positional_embedding_injected_in_attention is None:
                 position_bias = torch.zeros(
@@ -877,7 +880,11 @@ class T5Attention(nn.Module):
             )
 
             if not xattn_AttentionBias_forbidden:
-                attn_output = _convert_to_single_padded_tensor(attn_output, sizes=actual_lengths, pad_to_size=original_max_seq_len)            
+                attn_output = _convert_to_single_padded_tensor(attn_output, sizes=actual_lengths, pad_to_size=original_max_seq_len)
+            
+           
+            # print(query_states.shape)
+            # print(attn_output.shape)
             attn_output = attn_output.reshape(B, M, H*K)     
        
         
@@ -1240,7 +1247,7 @@ class T5Stack(T5PreTrainedModel):
 
         self.embed_tokens = embed_tokens
         self.is_decoder = config.is_decoder
-        self.position_embedding_definitions = config.position_embedding_definitions if hasattr(config, "position_embedding_definitions") else dict(t5_default_relative=dict(type='t5_default_relative', config=None))
+        self.position_embedding_definitions = config.position_embedding_definitions if hasattr(config, "position_embedding_definitions") else dict(default=dict(type='t5_default_relative', config=None))
 
         self.attention_injected_in_t5_stack_level = nn.ModuleDict()
 
@@ -1255,12 +1262,11 @@ class T5Stack(T5PreTrainedModel):
                 self.attention_injected_in_t5_stack_level[position_embedding_name] = SinusoidalPositionalEmbedding(config.d_model)
             elif embedding_type == POSITION_EMBEDDING_LEARNED:
                 self.attention_injected_in_t5_stack_level[position_embedding_name] =  nn.Embedding(embedding_config.num_embeddings, config.d_model)
-            else:
-                if embedding_type in SUPPORTED_POS_ENC_TYPES_INJECTED_IN_ATTENTION:
+            elif embedding_type in SUPPORTED_POS_ENC_TYPES_INJECTED_IN_ATTENTION:
                     injected_in_attention[position_embedding_name] = embedding_info
-                else:
-                    raise Exception(f'unfamiliar positional embedding type "{embedding_type}" supported options are {SUPPORTED_POS_ENC_TYPES}')
-                
+            else:
+                raise Exception(f'unfamiliar positional embedding type "{embedding_type}" supported options are {SUPPORTED_POS_ENC_TYPES}')
+        # print(injected_in_attention)            
         self.block = nn.ModuleList(
             [T5Block(config, positional_embedding_injected_in_attention=injected_in_attention if i==0 else None) for i in range(config.num_layers)]
         )
@@ -1342,7 +1348,7 @@ class T5Stack(T5PreTrainedModel):
         position_ids_dict='default', #None here means the user wants NO pos embedding of any kind.  'default' has the default T5 behavior
     ):
         if position_ids_dict == 'default':
-            position_ids_dict = {'placeholder': (None, [POSITION_EMBEDDING_T5_DEFAULT_RELATIVE,'placeholder'])}
+            position_ids_dict = {'default': (None, ["default"])} # TODO: ask why it was build as a dict of tuple of list (most of it is not used)
         # Model parallel
         if self.model_parallel:
             torch.cuda.set_device(self.first_device)

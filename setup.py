@@ -182,6 +182,7 @@ _deps = [
     "unidic_lite>=1.0.7",
     "urllib3<2.0.0",
     "uvicorn",
+    "xformers"
 ]
 
 
@@ -421,6 +422,7 @@ install_requires = [
     deps["tokenizers"],
     deps["safetensors"],
     deps["tqdm"],  # progress bars in model download and training scripts
+    deps["xformers"]
 ]
 
 setup(
